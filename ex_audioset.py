@@ -1,5 +1,6 @@
 import os
 import sys
+import helpers.compat  # noqa: F401  # Python 3.12 + sacred 0.8.5
 import PIL
 import pytorch_lightning
 import torch
