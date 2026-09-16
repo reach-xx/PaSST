@@ -1,4 +1,11 @@
-"""在 ESC-50 上取 2 条同类 + 1 条异类音频，同时输出分类结果和 embedding 余弦相似度。"""
+"""在 ESC-50 上取 2 条同类 + 1 条异类音频，同时输出分类结果和 embedding 余弦相似度。
+
+PaSST.forward 返回 (logits, features)：
+  logits    [50]   分类分数
+  features  [768]  CLS 与 DIST 的平均，用作 embedding
+
+余弦相似度在 L2 归一化后的 768 维向量上计算，同类应明显高于异类。
+"""
 
 from pathlib import Path
 
@@ -15,7 +22,7 @@ from test_esc50_ckpt import (
     load_waveform,
 )
 
-# fold=1 验证集：两条 dog，一条 thunderstorm
+# fold=1 验证集：两条 dog，一条 thunderstorm（训练时都没见过）
 PAIR_SAME = [
     DEFAULT_AUDIO_DIR / "1-100032-A-0.wav",
     DEFAULT_AUDIO_DIR / "1-110389-A-0.wav",
@@ -24,6 +31,7 @@ PAIR_DIFF = DEFAULT_AUDIO_DIR / "1-101296-A-19.wav"
 
 
 def infer(net, mel, wave, device):
+    """一次前向同时拿到分类概率和 768 维 embedding。"""
     wave = wave.to(device)
     spec = mel(wave.squeeze(1)).unsqueeze(1)
     logits, embedding = net(spec)
@@ -73,6 +81,7 @@ def main():
                 }
             )
 
+    # 先 L2 归一化再做点积 = 余弦相似度；对角线必为 1
     embs = torch.stack([r["embedding"] for r in results], dim=0)
     embs = F.normalize(embs, dim=1)
     sim = embs @ embs.T

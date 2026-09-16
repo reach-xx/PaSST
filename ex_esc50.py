@@ -58,11 +58,12 @@ def default_conf():
                                                                                                "").strip()
     process_id = os.getpid()
     models = {
+        # 默认没写 arch 时 get_model 会用 ap486；微调 ap476 请在命令行指定 models.net.arch
         "net": DynamicIngredient("models.passt.model_ing", n_classes=50, s_patchout_t=10, s_patchout_f=3),
         "mel": DynamicIngredient("models.preprocess.model_ing",
                                  instance_cmd="AugmentMelSTFT",
                                  n_mels=128, sr=32000, win_length=800, hopsize=320, n_fft=1024, freqm=48,
-                                 timem=80,
+                                 timem=80,  # 5s 频谱较短，时间掩蔽小于 AudioSet 的 192
                                  htk=False, fmin=0.0, fmax=None, norm=1, fmin_aug_range=10,
                                  fmax_aug_range=2000)
     }
@@ -125,9 +126,11 @@ class M(Ba3lModule):
         self.distributed_mode = self.config.trainer.num_nodes > 1
 
     def forward(self, x):
+        """x 已是 Mel [B,1,128,F]，net 返回 (logits, embedding)。"""
         return self.net(x)
 
     def mel_forward(self, x):
+        """波形 [B, 1, T] → Mel [B, 1, 128, F]。中间 squeeze 成 [B, T] 喂 AugmentMelSTFT。"""
         old_shape = x.size()
         x = x.reshape(-1, old_shape[2])
         x = self.mel(x)
@@ -155,7 +158,7 @@ class M(Ba3lModule):
             lam = lam.to(x.device)
             x = x * lam.reshape(batch_size, 1, 1, 1) + x[rn_indices] * (1. - lam.reshape(batch_size, 1, 1, 1))
 
-        y_hat, embed = self.forward(x)
+        y_hat, embed = self.forward(x)  # logits [B,50]，embedding [B,768]（训练损失只用 logits）
 
         if self.use_mixup:
             # y_mix = y * lam.reshape(batch_size, 1) + y[rn_indices] * (1. - lam.reshape(batch_size, 1))

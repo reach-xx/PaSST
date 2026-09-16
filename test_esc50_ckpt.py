@@ -1,13 +1,18 @@
-"""用 ESC-50 微调得到的 Lightning checkpoint 做单条/批量推理。"""
+"""用 ESC-50 微调得到的 Lightning checkpoint 做单条/批量推理。
+
+默认测 fold=1 验证集里 10 条音频（训练时没见过）。
+ESC-50 是 50 类单标签，用 softmax，不要用 AudioSet 的 sigmoid。
+"""
 
 from pathlib import Path
 import argparse
 
 import librosa
+import numpy as np
 import pandas as pd
 import torch
 
-import helpers.compat  # noqa: F401
+import helpers.compat  # noqa: F401  # Python 3.12 下先修 sacred 再间接 import 模型
 from models.passt import passt_s_swa_p16_128_ap476
 from models.preprocess import AugmentMelSTFT
 
@@ -15,8 +20,8 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CKPT = ROOT / "lightning_logs/version_0/checkpoints/epoch=9-step=9.ckpt"
 DEFAULT_CSV = ROOT / "audioset_hdf5s/esc50/meta/esc50.csv"
 DEFAULT_AUDIO_DIR = ROOT / "audioset_hdf5s/esc50/audio_32k"
-TARGET_SR = 32000
-CLIP_SECONDS = 5
+TARGET_SR = 32000  # 必须与预训练 / Mel 前端一致
+CLIP_SECONDS = 5   # ESC-50 官方时长
 
 # fold=1 是这次训练的验证折，下面几条都没进训练集
 DEMO_FILES = [
@@ -34,6 +39,7 @@ DEMO_FILES = [
 
 
 def load_label_map(csv_path: Path):
+    """target id → 类别名，以及 filename → (id, 名, fold)。"""
     df = pd.read_csv(csv_path)
     mapping = (
         df.drop_duplicates("target")
@@ -49,16 +55,21 @@ def load_label_map(csv_path: Path):
 
 
 def load_waveform(path: Path):
+    """读音频，单声道 32 kHz，定长 5s，形状 [1, 1, 160000] 供 Mel 使用。"""
     wav, _ = librosa.load(str(path), sr=TARGET_SR, mono=True)
     need = CLIP_SECONDS * TARGET_SR
     if len(wav) < need:
-        wav = __import__("numpy").pad(wav, (0, need - len(wav)))
+        wav = np.pad(wav, (0, need - len(wav)))
     else:
         wav = wav[:need]
     return torch.from_numpy(wav).float().view(1, 1, -1)
 
 
 def build_model():
+    """结构必须与微调时一致，但 pretrained=False：权重稍后从 ckpt 灌入。
+
+    img_size=(128, 998) 仍按 10s 建时间位置编码（长度 99），5s 前向时再切片。
+    """
     net = passt_s_swa_p16_128_ap476(
         pretrained=False,
         num_classes=50,
@@ -69,6 +80,7 @@ def build_model():
         s_patchout_t=10,
         s_patchout_f=5,
     )
+    # timem=80：ESC-50 频谱更短，时间掩蔽比 AudioSet 的 192 小
     mel = AugmentMelSTFT(
         n_mels=128, sr=32000, win_length=800, hopsize=320, n_fft=1024,
         freqm=48, timem=80, htk=False, fmin=0.0, fmax=None, norm=1,
@@ -78,6 +90,7 @@ def build_model():
 
 
 def load_checkpoint(net, ckpt_path: Path, use_swa=True):
+    """Lightning ckpt 的 key 带 net. / net_swa. 前缀，SWA 一般更好。"""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt["state_dict"]
     prefix = "net_swa." if use_swa and any(k.startswith("net_swa.") for k in state) else "net."
@@ -93,9 +106,10 @@ def load_checkpoint(net, ckpt_path: Path, use_swa=True):
 
 
 def predict_one(net, mel, wave, device):
+    """wave [1,1,T] → Mel [1,1,128,F] → softmax 概率 [50]。"""
     wave = wave.to(device)
-    spec = mel(wave.squeeze(1)).unsqueeze(1)
-    logits, _ = net(spec)
+    spec = mel(wave.squeeze(1)).unsqueeze(1)  # 加通道维，频谱当 2D 图
+    logits, _ = net(spec)  # 第二个返回值是 768 维 embedding，这里只要分类
     probs = torch.softmax(logits, dim=-1)[0]
     return probs.detach().cpu()
 
@@ -122,7 +136,7 @@ def main():
     net, mel = build_model()
     load_checkpoint(net, ckpt_path, use_swa=not args.no_swa)
     net.to(device).eval()
-    mel.to(device).eval()
+    mel.to(device).eval()  # 关闭 SpecAugment / Mel 频率抖动
 
     print("\n推理结果（ESC-50 单标签，softmax）:")
     n_correct = 0

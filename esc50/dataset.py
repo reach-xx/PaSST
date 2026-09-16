@@ -63,7 +63,7 @@ def decode_mp3(mp3_arr):
 
 
 def pad_or_truncate(x, audio_length):
-    """Pad all audio to specific length."""
+    """把波形补零或截断到固定长度（ESC-50 默认 5s × 32000 = 160000）。"""
     if len(x) <= audio_length:
         return np.concatenate((x, np.zeros(audio_length - len(x), dtype=np.float32)), axis=0)
     else:
@@ -135,6 +135,12 @@ class MixupDataset(TorchDataset):
 
 
 class AudioSetDataset(TorchDataset):
+    """ESC-50 波形数据集（类名沿用 AudioSet 时代的实现）。
+
+    fold=k 且 train=True：用另外 4 折训练；train=False：只用第 k 折验证。
+    返回 (波形[1, T], 文件名, 类别 id 0..49)，T=5s×sr。
+    """
+
     def __init__(self, meta_csv,  audiopath, fold, train=False, sample_rate=32000, classes_num=527,
                  clip_length=5, augment=False):
         """
@@ -164,18 +170,7 @@ class AudioSetDataset(TorchDataset):
         return len(self.df)
 
     def __getitem__(self, index):
-        """Load waveform and target of an audio clip.
-
-        Args:
-          meta: {
-            'hdf5_path': str,
-            'index_in_hdf5': int}
-        Returns:
-          data_dict: {
-            'audio_name': str,
-            'waveform': (clip_samples,),
-            'target': (classes_num,)}
-        """
+        """读一条 wav，重采样到 32 kHz，得到 [1, 160000] 和整数标签。"""
         row = self.df.iloc[index]
 
         #waveform = decode_mp3(np.fromfile(self.audiopath + row.filename, dtype='uint8'))

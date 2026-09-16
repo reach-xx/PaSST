@@ -1,9 +1,13 @@
-"""
-Most of this code comes from the timm  library.
-We tried to disentangle from the timm library version.
+"""PaSST：把 Mel 频谱当图的 Transformer 音频分类网络。
 
-Adapted from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+学习时请优先看：
+  PatchEmbed          —— 16×16 / stride 10 切 patch
+  PaSST.__init__      —— 时/频位置编码形状 [1,768,12,1] 与 [1,768,1,99]
+  PaSST.forward_features
+  PaSST.forward       —— 返回 (logits, embedding)
+  get_model / passt_s_swa_p16_128_ap476
 
+其余 default_cfgs、大量 ViT 工厂函数来自 timm，一般不用改。
 """
 import math
 import logging
@@ -269,7 +273,9 @@ def adapt_input_conv(in_chans, conv_weight):
 
 
 class Mlp(nn.Module):
-    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """Transformer 块里的前馈网络：Linear → GELU → Dropout → Linear → Dropout。
+
+    默认 hidden = 4 * dim，即 768 → 3072 → 768。
     """
 
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -296,7 +302,15 @@ PLUS1_TRICK = False
 
 
 class PatchEmbed(nn.Module):
-    """ 2D Image to Patch Embedding
+    """把 Mel 频谱图切成重叠 patch，并投影到 embed_dim。
+
+    输入当单通道图：[B, 1, 频率=128, 时间=F]
+    Conv2d(k=16×16, stride=10×10, out=768)：
+      - 每个窗口覆盖 16 个 Mel 带 × 16 个时间帧（256 个数混成 768 维）
+      - 步长 10 < 16，相邻窗口重叠 6
+      - 频率格点数 (128-16)/10+1 = 12
+      - 时间格点数 (F-16)/10+1，5s 约 49，10s 约 99
+    PaSST 里 flatten=False，保持 [B, 768, 12, T'] 以便加可分解的时/频位置编码。
     """
 
     def __init__(self, img_size=224, patch_size=16, stride=16, in_chans=3, embed_dim=768, norm_layer=None,
@@ -305,9 +319,10 @@ class PatchEmbed(nn.Module):
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
         stride = to_2tuple(stride)
-        self.img_size = img_size
+        self.img_size = img_size          # 预训练假定的 (频率, 时间)，如 (128, 998)
         self.patch_size = patch_size
         self.stride = stride
+        # 用整除近似格点；真正 conv 输出以 (H-k)/s+1 为准，两者在这组超参下一致
         self.grid_size = (img_size[0] // stride[0], img_size[1] // stride[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.flatten = flatten
@@ -318,6 +333,7 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         if not (H == self.img_size[0] and W == self.img_size[1]):
+            # 5s ESC-50 常见 128*500 vs 预训练 128*998，后面会截断时间位置编码
             warnings.warn(f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]}).")
         # to do maybe replace weights
         x = self.proj(x)
@@ -329,6 +345,12 @@ class PatchEmbed(nn.Module):
 
 
 class Attention(nn.Module):
+    """多头自注意力。输入 [B, N, C]，N 为 CLS/DIST + 所有 patch。
+
+    默认 C=768、heads=12，每个 head 维数 64。softmax(QK^T / sqrt(64)) V 后拼回 768。
+    这一步让不同频率行、不同时间列的 patch 互相看见，补上 PatchEmbed 只看局部 16×16 的限制。
+    """
+
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
@@ -362,6 +384,7 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
+    """标准 Pre-LN ViT 块：x + Attn(LN(x))，再 x + MLP(LN(x))。PaSST-S 堆 12 层。"""
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
@@ -381,11 +404,16 @@ class Block(nn.Module):
 
 
 class PaSST(nn.Module):
-    """
+    """Patchout 音频 Spectrogram Transformer。把 log-Mel 当图，用 ViT 做分类，同时吐出 embedding。
 
-    Based on the implementation of Vision Transformer in timm library.
-     Take a look at the get_model function, adapting the weights of pretrained imagenet models.
+    与普通 ViT 的关键差别（论文 2110.05069）：
+    1) 位置编码拆成频率向量 + 时间向量，相加，方便变长音频截断时间轴
+    2) 训练时 Structured / Unstructured Patchout，丢掉部分 patch 降计算量
+    3) DeiT 蒸馏：CLS + DIST 两个 token，embedding = 二者平均
 
+    forward 返回 (logits, features)：
+      features [B, 768]  —— 分类头之前的向量，可做相似度
+      logits   [B, C]    —— C=527 AudioSet / C=50 ESC-50
     """
 
     def __init__(self, u_patchout=0, s_patchout_t=0, s_patchout_f=0, img_size=(128, 998), patch_size=16, stride=16,
@@ -428,16 +456,18 @@ class PaSST(nn.Module):
 
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, stride=stride, in_chans=in_chans, embed_dim=embed_dim,
-            flatten=False)
+            flatten=False)  # 保持 2D 网格，好加时/频位置编码
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
-        # PaSST
+        # 可分解位置编码：频率、时间分开存，变长时只切时间轴
         # refer to https://arxiv.org/abs/2110.05069 Section 2
-        self.new_pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))  # for C and D tokens
-        self.freq_new_pos_embed = nn.Parameter(torch.zeros(1, embed_dim, self.patch_embed.grid_size[0], 1))  # | f
-        self.time_new_pos_embed = nn.Parameter(torch.zeros(1, embed_dim, 1, self.patch_embed.grid_size[1]))  # __ t
+        self.new_pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))  # CLS/DIST 自己的偏置
+        # [1, 768, 12, 1] 沿频率广播到每个时间格
+        self.freq_new_pos_embed = nn.Parameter(torch.zeros(1, embed_dim, self.patch_embed.grid_size[0], 1))
+        # [1, 768, 1, 99] 预训练 10s 的时间格；5s 前向时切成 49
+        self.time_new_pos_embed = nn.Parameter(torch.zeros(1, embed_dim, 1, self.patch_embed.grid_size[1]))
         ####
         self.pos_drop = nn.Dropout(p=drop_rate)
 
@@ -459,11 +489,12 @@ class PaSST(nn.Module):
         else:
             self.pre_logits = nn.Identity()
 
-        # Classifier head(s)
+        # Classifier head(s)：微调 ESC-50 时 n_classes=50，加载预训练会丢掉原来的 527 类头
         self.head = nn.Sequential(nn.LayerNorm(self.num_features),
                                   nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity())
         self.head_dist = None
         if distilled:
+            # 训练 DeiT 时用；本仓库推理走 head((CLS+DIST)/2)，不用单独的 head_dist
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
         self.init_weights(weight_init)
@@ -504,14 +535,16 @@ class PaSST(nn.Module):
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
+        """频谱 [B,1,128,F] → CLS/DIST 特征。蒸馏模型返回 (cls, dist) 两个 [B,768]。"""
         global first_RUN  # not jit friendly? use trace instead
-        x = self.patch_embed(x)  # [b, e, f, t]
+        x = self.patch_embed(x)  # [B, 768, 12, T']，T' 对 5s 约 49、对 10s 约 99
         B_dim, E_dim, F_dim, T_dim = x.shape  # slow
         if first_RUN: print(" patch_embed : ", x.shape)
         # Adding Time/Freq information
         if first_RUN: print(" self.time_new_pos_embed.shape", self.time_new_pos_embed.shape)
-        time_new_pos_embed = self.time_new_pos_embed
+        time_new_pos_embed = self.time_new_pos_embed  # 参数本身始终 [1,768,1,99]
         if x.shape[-1] < time_new_pos_embed.shape[-1]:
+            # 音频更短：切时间编码。训练随机起点，推理取前 T' 帧（对齐 10s 的开头）
             if self.training:
                 toffset = torch.randint(1 + time_new_pos_embed.shape[-1] - x.shape[-1], (1,)).item()
                 if first_RUN: print(f" CUT with randomoffset={toffset} time_new_pos_embed.shape",
@@ -526,9 +559,10 @@ class PaSST(nn.Module):
             x = x[:, :, :, :time_new_pos_embed.shape[-1]]
         x = x + time_new_pos_embed
         if first_RUN: print(" self.freq_new_pos_embed.shape", self.freq_new_pos_embed.shape)
-        x = x + self.freq_new_pos_embed
+        x = x + self.freq_new_pos_embed  # 广播到所有时间格
 
         # Structured Patchout https://arxiv.org/abs/2110.05069 Section 2.2
+        # 只在 training：丢掉整列时间 / 整行频率，缩短注意力序列
         if self.training and self.s_patchout_t:
             if first_RUN: print(f"X Before time Patchout of {self.s_patchout_t} ", x.size())
             # ([1, 768, 1, 82])
@@ -542,9 +576,9 @@ class PaSST(nn.Module):
             x = x[:, :, random_indices, :]
             if first_RUN: print(" \n X after freq Patchout: ", x.size())
         ###
-        # Flatten the sequence
+        # Flatten the sequence：[B, 768, F', T'] → [B, F'*T', 768]
         x = x.flatten(2).transpose(1, 2)
-        # Unstructured Patchout
+        # Unstructured Patchout：展平后随机丢若干 patch（ESC-50 默认 u_patchout=0）
         if first_RUN: print("X flattened", x.size())
         if self.training and self.u_patchout:
             seq_len = x.shape[1]
@@ -571,16 +605,17 @@ class PaSST(nn.Module):
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
         else:
-            return x[:, 0], x[:, 1]
+            return x[:, 0], x[:, 1]  # CLS, DIST
 
     def forward(self, x):
+        """x: Mel [B,1,128,F] → (logits [B,C], embedding [B,768])。"""
         global first_RUN
         if first_RUN: print("x", x.size())
 
         x = self.forward_features(x)
 
         if self.head_dist is not None:
-            features = (x[0] + x[1]) / 2
+            features = (x[0] + x[1]) / 2  # 蒸馏模型：两 token 平均当 embedding
             if first_RUN: print("forward_features", features.size())
             x = self.head(features)
             if first_RUN: print("head", x.size())
@@ -754,7 +789,10 @@ def deit_base_distilled_patch16_384(pretrained=False, **kwargs):
 
 
 def passt_s_swa_p16_128_ap476(pretrained=False, **kwargs):
-    """ PaSST pre-trained on AudioSet
+    """AudioSet 预训练 PaSST-S（SWA，mAP=0.476）。
+
+    名字含义：s=Small，swa=Stochastic Weight Averaging，p16=patch 16，
+    128=Mel 带数，ap476=AudioSet mAP。蒸馏版 distilled=True。
     """
     print("\n\n Loading PaSST pre-trained on AudioSet Patch 16 stride 10 structured patchout mAP=476 SWA \n\n")
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
@@ -959,21 +997,11 @@ def get_model(arch="passt_s_kd_p16_128_ap486", pretrained=True, n_classes=527, i
               tstride=10,
               input_fdim=128, input_tdim=998, u_patchout=0, s_patchout_t=0, s_patchout_f=0,
               ):
-    """
-    :param arch: Base ViT or Deit architecture
-    :param pretrained: use pretrained model on imagenet
-    :param n_classes: number of classes
-    :param in_channels: number of input channels: 1 for mono
-    :param fstride: the patches stride over frequency.
-    :param tstride: the patches stride over time.
-    :param input_fdim: the expected input frequency bins.
-    :param input_tdim: the expected input time bins.
-    :param u_patchout: number of input patches to drop in Unstructured Patchout as defined in https://arxiv.org/abs/2110.05069
-    :param s_patchout_t: number of input time frames to drop Structured Patchout as defined in https://arxiv.org/abs/2110.05069
-    :param s_patchout_f:  number of input frequency bins to drop Structured Patchout as defined in https://arxiv.org/abs/2110.05069
-    :param audioset_pretrain: use pretrained models on Audioset.
-    :return:
+    """按架构名构建 PaSST。ex_esc50 通过 models.net.arch / n_classes 调用这里。
 
+    注意：函数默认 arch 是 KD 的 ap486，微调 ap476 必须显式传入
+    models.net.arch=passt_s_swa_p16_128_ap476。
+    n_classes 与预训练 527 不同时，分类头随机初始化，主干仍加载 AudioSet 权重。
     """
     model_func = None
     input_size = (input_fdim, input_tdim)
